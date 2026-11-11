@@ -1,0 +1,96 @@
+"""Metrics API — batch outcomes by root cause, and the bandit's posteriors.
+
+`/metrics/batch` used to return `recovery_rate` and a per-cause `{total, recovered, failed}`
+split. Two problems, both of which the eval report addresses at length. The rate counted
+self-recoveries as wins. And the per-cause breakdown was keyed on the *predicted* root
+cause, which makes it a picture of what the classifier believed rather than of what happened
+— on a cause the model confuses, the row describes a mixture of two populations and the rate
+in it is not a rate of anything.
+
+The predicted-cause keying is kept, because in production the predicted label is the only
+one that exists and the breakdown is genuinely useful for spotting a cause the policy is
+losing on. But it is named as a prediction, and the rate is replaced by the attribution
+split, so a row cannot claim a win it did not earn. The true-cause version of this table is
+in `/eval/causes`, where the simulator knows the answer.
+"""
+
+from fastapi import APIRouter
+
+from app.api.dashboard import (
+    ATTRIBUTION_LABELS,
+    ATTRIBUTION_ORDER,
+    UNATTRIBUTED_WHY,
+    audit_backed_sessions,
+)
+from app.db.database import select_all
+from app.execution import attribution
+from app.strategy.bandit import bandit
+
+router = APIRouter()
+
+
+@router.get("/metrics/batch")
+async def get_batch_report():
+    """Closed sessions, split by attribution and by the cause the classifier predicted."""
+    data = [
+        row
+        for row in select_all(
+            "recovery_sessions", "id, status, amount_recovered, root_cause, attribution"
+        )
+        if row.get("status") != "OPEN"
+    ]
+    observed = audit_backed_sessions()
+
+    def _empty() -> dict:
+        return {
+            "sessions": 0,
+            "amount_recovered_paise": 0,
+            "attributed": {v: 0 for v in ATTRIBUTION_ORDER},
+            "unattributed": 0,
+            "escalated": 0,
+            "closed_without_recovery": 0,
+        }
+
+    overall = _empty()
+    by_predicted_cause: dict[str, dict] = {}
+
+    for row in data:
+        cause = row.get("root_cause") or "UNCLASSIFIED"
+        bucket = by_predicted_cause.setdefault(cause, _empty())
+        # Same rule as the dashboard, through the same function: the column alone is not
+        # evidence, and this table used to count the legacy coin flips as wins too.
+        verdict = attribution.verdict_of(row, observed)
+        for target in (overall, bucket):
+            target["sessions"] += 1
+            if row.get("status") == "RECOVERED":
+                target["amount_recovered_paise"] += row.get("amount_recovered") or 0
+                if verdict in target["attributed"]:
+                    target["attributed"][verdict] += 1
+                else:
+                    target["unattributed"] += 1
+            else:
+                target["closed_without_recovery"] += 1
+                if row.get("status") == "ESCALATED":
+                    target["escalated"] += 1
+
+    return {
+        "batch_size": len(data),
+        "overall": overall,
+        "by_predicted_cause": by_predicted_cause,
+        "attribution_labels": ATTRIBUTION_LABELS,
+        "unattributed_note": UNATTRIBUTED_WHY,
+        "keyed_on": (
+            "The cause the classifier predicted, not the true one — in production there is "
+            "no other label available. Inference from the error fields alone is bounded at "
+            "68.38% under the cause mix these batches have (65.78% under a uniform prior), "
+            "so treat a row on a confusable cause as a mixture rather than a population. "
+            "The true-cause breakdown is at /api/v1/eval/causes."
+        ),
+    }
+
+
+@router.get("/metrics/bandit")
+async def get_bandit_learning():
+    """Get bandit learning curves for dashboard."""
+    data = await bandit.get_learning_data()
+    return {"contexts": data}
