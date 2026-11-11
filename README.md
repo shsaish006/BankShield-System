@@ -1,4 +1,4 @@
-# PayRevive — measured revenue recovery for failed payments
+# BankShield System — measured revenue recovery for failed payments
 
 
 The brief asks for one thing above all else:
